@@ -637,5 +637,6 @@ footer{text-align:center;color:var(--muted);font-size:.78rem;padding:30px 0;bord
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
+    # Hugging Face Spaces expects port 7860, but we also support custom PORT env var
+    port = int(os.environ.get("PORT", 7860))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
