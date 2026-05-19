@@ -1,3 +1,12 @@
+---
+title: AllAnime API
+emoji: 🎬
+colorFrom: purple
+colorTo: blue
+sdk: docker
+pinned: false
+---
+
 <div align="center">
 
 <img src="https://readme-typing-svg.demolab.com?font=Fira+Code&size=32&pause=1000&color=7C5CBF&center=true&vCenter=true&width=600&lines=AllAnime+API;Scrape+allmanga.to+like+a+pro;Self-hosted+%26+free+forever" alt="Typing SVG" />
