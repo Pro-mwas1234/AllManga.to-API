@@ -269,18 +269,75 @@ curl "http://localhost:8000/anime/stream?url=https://dood.wf/e/XXXXX&server=dood
 
 ## Docker
 
-```dockerfile
-FROM python:3.11-slim
-WORKDIR /app
-COPY . .
-RUN pip install fastapi "uvicorn[standard]" "httpx[http2]" beautifulsoup4 lxml pycryptodome
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
-```
-
 ```bash
+# Build the image
 docker build -t allanime-api .
+
+# Run the container
 docker run -p 8000:8000 allanime-api
 ```
+
+Open **http://localhost:8000** to access the API docs.
+
+---
+
+## Deploy on Hugging Face Spaces
+
+You can deploy this API on Hugging Face Spaces for free:
+
+1. Go to [Hugging Face Spaces](https://huggingface.co/spaces)
+2. Click **Create new Space**
+3. Choose a name and select **Docker** as the SDK
+4. Choose **Blank** template
+5. In your local repo, create a file named `README.md` in the root (this file)
+6. Push your code to the Space repository:
+
+```bash
+# Install huggingface_hub if you haven't already
+pip install huggingface_hub
+
+# Login to Hugging Face
+huggingface-cli login
+
+# Create and push to your Space
+git init
+git add .
+git commit -m "Initial commit"
+git remote add origin https://huggingface.co/spaces/YOUR_USERNAME/YOUR_SPACE_NAME
+git push -u origin main
+```
+
+7. Your Space will automatically build and deploy the Docker container
+8. Access your API at `https://YOUR_USERNAME-YOUR_SPACE_NAME.hf.space`
+
+### Alternative: Using the Hugging Face CLI
+
+```bash
+# Install the CLI
+pip install huggingface_hub
+
+# Login
+huggingface-cli login
+
+# Create a new Space (interactive)
+huggingface-cli repo create --type space --space_sdk docker
+
+# Clone your Space
+git clone https://huggingface.co/spaces/YOUR_USERNAME/YOUR_SPACE_NAME
+cd YOUR_SPACE_NAME
+
+# Copy files from this repo
+cp /path/to/this/repo/main.py .
+cp /path/to/this/repo/requirements.txt .
+cp /path/to/this/repo/Dockerfile .
+
+# Push to Hugging Face
+git add .
+git commit -m "Deploy AllAnime API"
+git push
+```
+
+The Space will automatically detect the `Dockerfile` and build your application.
 
 ---
 
