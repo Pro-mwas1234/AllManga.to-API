@@ -9,6 +9,7 @@ from bs4 import BeautifulSoup
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 GQL_URL    = "https://api.allanime.day/api"
+ANILIST_URL = "https://graphql.anilist.co"
 SITE_URL   = "https://allmanga.to"
 CDN_BASE   = "https://allanimenews.com"
 VALID_SORTS  = {"Latest_Update", "Trending", "Name_ASC", "Name_DESC"}
@@ -59,6 +60,20 @@ async def gql(query: str, cookie: str = "") -> dict:
     r.raise_for_status()
     return r.json()
 
+async def anilist_gql(query: str, variables: dict = None) -> dict:
+    """Query AniList GraphQL API"""
+    client = await get_client()
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    payload = {"query": query}
+    if variables:
+        payload["variables"] = variables
+    r = await client.post(ANILIST_URL, json=payload, headers=headers)
+    r.raise_for_status()
+    return r.json()
+
 # ── Query builders (plain concatenation — no f-strings with GraphQL fields) ────
 def q_shows(sort: str, limit: int, page: int,
             trans: str = "", country: str = "", anime_type: str = "",
@@ -99,6 +114,121 @@ def q_episode_sources(show_id: str, ep: str, trans: str) -> str:
         + ep
         + "\"){episodeString sourceUrls}}"
     )
+
+# ── AniList ID Converter ───────────────────────────────────────────────────────
+async def convert_to_anilist_id(show_id: str) -> Optional[dict]:
+    """
+    Convert AllAnime show_id to AniList ID by fetching show details
+    and searching AniList by title
+    """
+    try:
+        # Get AllAnime show details
+        data = await gql(q_show(show_id))
+        show = data.get("data", {}).get("show")
+        
+        if not show:
+            return None
+        
+        # Extract all possible titles for matching
+        titles = []
+        if show.get("name"):
+            titles.append(show["name"])
+        if show.get("englishName"):
+            titles.append(show["englishName"])
+        if show.get("nativeName"):
+            titles.append(show["nativeName"])
+        if show.get("altNames"):
+            titles.extend(show["altNames"])
+        
+        # Remove duplicates and empty strings
+        titles = list(filter(None, set(titles)))
+        
+        if not titles:
+            return None
+        
+        # AniList search query
+        anilist_query = """
+        query ($search: String, $type: MediaType) {
+          Media(search: $search, type: $type) {
+            id
+            idMal
+            title {
+              romaji
+              english
+              native
+            }
+            synonyms
+            format
+            episodes
+            averageScore
+            season
+            seasonYear
+            coverImage {
+              large
+            }
+            genres
+            status
+          }
+        }
+        """
+        
+        # Try searching with primary title first
+        variables = {
+            "search": titles[0],
+            "type": "ANIME"
+        }
+        
+        anilist_data = await anilist_gql(anilist_query, variables)
+        anilist_media = anilist_data.get("data", {}).get("Media")
+        
+        if anilist_media:
+            return {
+                "allAnimeId": show_id,
+                "anilistId": anilist_media["id"],
+                "malId": anilist_media.get("idMal"),
+                "matchedTitle": titles[0],
+                "anilistData": anilist_media,
+                "allAnimeData": {
+                    "name": show.get("name"),
+                    "englishName": show.get("englishName"),
+                    "nativeName": show.get("nativeName"),
+                    "altNames": show.get("altNames"),
+                    "episodeCount": show.get("episodeCount"),
+                    "type": show.get("type"),
+                    "season": show.get("season"),
+                }
+            }
+        
+        return None
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+async def batch_convert_to_anilist(show_ids: list[str]) -> dict:
+    """Convert multiple AllAnime IDs to AniList IDs in parallel"""
+    tasks = [convert_to_anilist_id(sid) for sid in show_ids]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    conversions = []
+    errors = []
+    
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            errors.append({"show_id": show_ids[i], "error": str(result)})
+        elif result and "error" not in result:
+            conversions.append(result)
+        elif result:
+            errors.append({"show_id": show_ids[i], "error": result.get("error")})
+        else:
+            errors.append({"show_id": show_ids[i], "error": "Not found"})
+    
+    return {
+        "total": len(show_ids),
+        "successful": len(conversions),
+        "failed": len(errors),
+        "conversions": conversions,
+        "errors": errors if errors else None
+    }
 
 # ── URL decoder ────────────────────────────────────────────────────────────────
 def decode_url(raw: str) -> str:
@@ -449,6 +579,54 @@ async def stream(
     results = await extract_stream(url, server)
     return {"url": url, "server": server or "auto", "streams": results}
 
+# ── NEW: AniList ID Conversion Routes ──────────────────────────────────────────
+
+@app.get("/anime/anilist/{show_id}")
+async def get_anilist_id(show_id: str = Path(..., description="AllAnime show ID")):
+    """
+    Convert a single AllAnime show_id to AniList ID.
+    Returns the AniList ID, MAL ID, and metadata from both APIs.
+    """
+    result = await convert_to_anilist_id(show_id)
+    
+    if not result:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Could not find matching anime on AniList"}
+        )
+    
+    if "error" in result:
+        return JSONResponse(
+            status_code=500,
+            content={"error": result["error"]}
+        )
+    
+    return result
+
+@app.post("/anime/anilist/batch")
+async def batch_get_anilist_ids(show_ids: list[str]):
+    """
+    Convert multiple AllAnime show_ids to AniList IDs in parallel.
+    Send a JSON array of show_ids in the request body.
+    
+    Example request body:
+    ["ReooPAxPMsHM4KPMY", "jbJnkcKSzYjwd3NGY", "vn6K7X7KgYHcgScaW"]
+    """
+    if not show_ids or len(show_ids) == 0:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "show_ids array cannot be empty"}
+        )
+    
+    if len(show_ids) > 50:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Maximum 50 show_ids per batch request"}
+        )
+    
+    result = await batch_convert_to_anilist(show_ids)
+    return result
+
 # ── Global error handler ───────────────────────────────────────────────────────
 @app.exception_handler(Exception)
 async def global_error(request: Request, exc: Exception):
@@ -463,7 +641,7 @@ HTML_DOCS = """<!DOCTYPE html>
 <title>AllAnime API</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#08091a;--card:#0f1128;--border:#1b1d3a;--accent:#7c5cbf;--blue:#5b8af5;--green:#3ecf8e;--red:#f87171;--text:#dde0f5;--muted:#6b6e9a;--tag:#141630;--code:#a5f3fc}
+:root{--bg:#08091a;--card:#0f1128;--border:#1b1d3a;--accent:#7c5cbf;--blue:#5b8af5;--green:#3ecf8e;--red:#f87171;--text:#dde0f5;--muted:#6b6e9a;--tag:#141630;--code:#a5f3fc;--orange:#fb923c}
 body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;line-height:1.6}
 header{background:linear-gradient(135deg,#0a0a25,#160d3a,#0b1530);border-bottom:1px solid var(--border);padding:52px 24px 40px;text-align:center}
 h1{font-size:2.6rem;font-weight:900;letter-spacing:-1px;background:linear-gradient(90deg,#a78bfa,#60a5fa,#34d399);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
@@ -471,12 +649,14 @@ header p{color:var(--muted);margin-top:10px;font-size:1rem}
 .badges{display:flex;justify-content:center;gap:10px;margin-top:18px;flex-wrap:wrap}
 .badge{background:var(--tag);border:1px solid var(--border);border-radius:20px;padding:4px 14px;font-size:.75rem;color:var(--muted)}
 .badge.live{border-color:var(--green);color:var(--green)}
+.badge.new{border-color:var(--orange);color:var(--orange)}
 main{max-width:980px;margin:0 auto;padding:44px 24px 80px}
 .sec{font-size:.68rem;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:44px 0 14px}
 .card{background:var(--card);border:1px solid var(--border);border-radius:14px;margin-bottom:14px;overflow:hidden;transition:border-color .2s}
 .card:hover{border-color:var(--accent)}
 .ch{display:flex;align-items:flex-start;gap:12px;padding:20px 22px 12px;flex-wrap:wrap}
 .method{background:var(--blue);color:#fff;font-size:.68rem;font-weight:800;padding:3px 10px;border-radius:5px;letter-spacing:.06em;margin-top:3px;flex-shrink:0}
+.method.post{background:var(--green)}
 .path{font-family:Consolas,monospace;font-size:.98rem;font-weight:700;color:#c4b5fd;flex:1;word-break:break-all}
 .desc{color:var(--muted);font-size:.86rem;padding:0 22px 14px;line-height:1.55}
 .desc code,.desc strong{color:var(--text)}
@@ -498,6 +678,7 @@ tr:last-child td{border:none}
 .ct{font-size:.72rem;color:var(--muted);margin-top:2px}
 .info{background:#0a1422;border:1px solid #1a3454;border-radius:10px;padding:16px 20px;font-size:.84rem;color:#94c5f8;line-height:1.75;margin-top:6px}
 .info code{background:#060d18;padding:1px 6px;border-radius:4px;font-family:monospace;font-size:.8em}
+.highlight{background:#1a1235;border:1px solid #3b2561;border-radius:10px;padding:16px 20px;font-size:.84rem;color:#d8b4fe;line-height:1.75;margin-top:6px}
 footer{text-align:center;color:var(--muted);font-size:.78rem;padding:30px 0;border-top:1px solid var(--border)}
 </style>
 </head>
@@ -507,6 +688,7 @@ footer{text-align:center;color:var(--muted);font-size:.78rem;padding:30px 0;bord
   <p>Unofficial REST API for allmanga.to &mdash; anime info, episodes &amp; all streaming servers</p>
   <div class="badges">
     <span class="badge live">&#9679; Live</span>
+    <span class="badge new">AniList Integration</span>
     <span class="badge">Python &middot; FastAPI</span>
     <span class="badge">GraphQL scraper</span>
     <span class="badge">10 stream servers</span>
@@ -596,6 +778,44 @@ footer{text-align:center;color:var(--muted);font-size:.78rem;padding:30px 0;bord
   <div class="ex"><span class="eu">/anime/stream?url=https://dood.wf/e/XXXXX&amp;server=doodstream</span><a class="btn" href="/docs#/default/stream_anime_stream_get" target="_blank">Open in Swagger &#8599;</a></div>
 </div>
 
+<div class="sec">&#11088; NEW: AniList Integration</div>
+
+<div class="card">
+  <div class="ch"><span class="method">GET</span><span class="path">/anime/anilist/{show_id}</span></div>
+  <div class="desc">Convert an AllAnime show ID to its corresponding <strong>AniList ID</strong> and <strong>MyAnimeList ID</strong>. Returns comprehensive metadata from both APIs including titles, genres, scores, and cover images. Perfect for linking AllAnime content with AniList tracking or MAL databases.</div>
+  <table><tr><th>Param</th><th>Notes</th></tr>
+  <tr><td class="pn">show_id <span class="req">required</span></td><td>AllAnime show ID (e.g. <code>ReooPAxPMsHM4KPMY</code>)</td></tr>
+  </table>
+  <div class="ex">
+    <span class="eu">/anime/anilist/ReooPAxPMsHM4KPMY</span>
+    <a class="btn" href="/anime/anilist/ReooPAxPMsHM4KPMY" target="_blank">Try it (One Piece) &#8599;</a>
+  </div>
+  <div class="highlight">
+    <strong>&#128161; Response includes:</strong><br>
+    &bull; <code>anilistId</code> &mdash; AniList database ID<br>
+    &bull; <code>malId</code> &mdash; MyAnimeList database ID<br>
+    &bull; <code>anilistData</code> &mdash; Full AniList metadata (title variants, genres, score, episodes, cover image, season, year, status)<br>
+    &bull; <code>allAnimeData</code> &mdash; AllAnime metadata for cross-reference
+  </div>
+</div>
+
+<div class="card">
+  <div class="ch"><span class="method post">POST</span><span class="path">/anime/anilist/batch</span></div>
+  <div class="desc">Convert multiple AllAnime show IDs to AniList/MAL IDs in parallel. Send up to <strong>50 show IDs</strong> at once for efficient batch processing. All conversions run concurrently for maximum speed.</div>
+  <table><tr><th>Body</th><th>Notes</th></tr>
+  <tr><td class="pn">show_ids <span class="req">required</span></td><td>JSON array of AllAnime show IDs (max 50)</td></tr>
+  </table>
+  <div class="ex"><span class="eu">POST /anime/anilist/batch</span><a class="btn" href="/docs#/default/batch_get_anilist_ids_anime_anilist_batch_post" target="_blank">Try in Swagger &#8599;</a></div>
+  <div class="highlight">
+    <strong>&#128196; Request body example:</strong><br>
+    <code>["ReooPAxPMsHM4KPMY", "jbJnkcKSzYjwd3NGY", "vn6K7X7KgYHcgScaW"]</code><br><br>
+    <strong>&#128202; Response includes:</strong><br>
+    &bull; <code>total</code> / <code>successful</code> / <code>failed</code> counts<br>
+    &bull; <code>conversions</code> array with all successful matches<br>
+    &bull; <code>errors</code> array with failed conversions (if any)
+  </div>
+</div>
+
 <div class="sec">Supported Stream Servers</div>
 <div class="grid">
   <div class="chip"><div class="cn">AllAnime CDN</div><div class="ct">Direct MP4 &mdash; no captcha</div></div>
@@ -631,11 +851,12 @@ footer{text-align:center;color:var(--muted);font-size:.78rem;padding:30px 0;bord
 </div>
 
 </main>
-<footer>AllAnime API &mdash; for personal &amp; educational use only</footer>
+<footer>AllAnime API &mdash; for personal &amp; educational use only &middot; Now with AniList integration</footer>
 </body>
 </html>"""
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    # Hugging Face Spaces expects port 7860, but we also support custom PORT env var
+    port = int(os.environ.get("PORT", 7860))
+    uvicorn.run("allanime_api_enhanced:app", host="0.0.0.0", port=port, reload=False)
